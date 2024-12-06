@@ -1,0 +1,2 @@
+skinparam monochrome reverse
+skinparam backgroundColor transparent

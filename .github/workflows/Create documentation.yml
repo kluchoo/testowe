@@ -1,0 +1,169 @@
+name: Create documentation
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+
+env:
+  NEWEST_TAG: ${{ github.ref_name }}
+  REPO: ${{ github.repository }}
+  FILE_NAME: main
+  IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+  LATEX_DIR: ./docs/latex/
+  HTML_DIR: ./docs/html
+  PYTHON_VERSION: 3.13
+  UML_FILE: uml.puml
+  HEADER_FILE: ___HEADER_FILE___
+
+jobs:
+  Create_documentation:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # cache: 'pip' # caching pip dependencies
+      - run: |
+          python -m pip install --upgrade pip
+          pip install uv --break-system-packages
+          uv venv
+          uv pip install hpp2plantuml
+
+      - name: plantuml to file
+        run: |
+          uv run hpp2plantuml -i *.hpp -o ${{ env.UML_FILE }}
+          curl -F "file1=@${{ env.UML_FILE }}" ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Ading UML to Header file
+        run: |
+          uv run ./convert.py ${{env.UML_FILE}} ${{env.HEADER_FILE}}
+
+
+      - name: Check for cache
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        id: cache-packages
+        with:
+          packages: graphviz ghostscript
+          version: 1.0
+          execute_install_scripts: true
+
+      - name: Install required packages
+        if: steps.cache-packages.outputs.cache-hit != 'true'
+        run: sudo apt update && sudo apt install -y graphviz ghostscript
+
+      - name: Cache Docker images
+        if: env.IS_TAG == 'true'
+        id: docker_cache
+        uses: ScribeMD/docker-cache@0.5.0
+        with:
+          key: docker-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+
+      - name: Pull TeX Live Docker image if not cached
+        if: env.IS_TAG == 'true' && steps.docker_cache.outputs.cache-hit != 'true'
+        run: docker pull ghcr.io/xu-cheng/texlive-full:latest
+
+
+      - name: PlantUML
+        run: |
+          latest_version=$(curl -s https://api.github.com/repos/plantuml/plantuml/releases/latest | jq -r '.tag_name')
+          download_url="https://github.com/plantuml/plantuml/releases/download/${latest_version}/plantuml-${latest_version#"v"}.jar"
+          wget -q -O plantuml.jar "$download_url"
+
+          echo -e "PLANTUML_JAR_PATH      = plantuml.jar\n" >> Doxyfile
+          echo -e "PLANTUML_CFG_FILE      = config.txt\n" >> Doxyfile
+          echo -e "skinparam monochrome reverse\nskinparam backgroundColor transparent\n" > config.txt
+
+
+      - name: Prettify doxygen
+        run: |
+          latest_version=$(curl -s https://api.github.com/repos/jothepro/doxygen-awesome-css/releases/latest | jq -r '.tag_name')
+          download_url="https://github.com/jothepro/doxygen-awesome-css/archive/refs/tags/${latest_version}.tar.gz"
+          wget -q -O doxygen-awesome-css.tar.gz "$download_url"
+
+          tar -xzf doxygen-awesome-css.tar.gz
+          mv doxygen-awesome-css*/ doxygen-awesome-css/
+          cp doxygen-awesome-css/doxygen-awesome.css doxygen-awesome-css/doxygen-awesome-sidebar-only.css -t . 
+          echo "GENERATE_TREEVIEW      = YES" >> Doxyfile
+          echo "DISABLE_INDEX          = NO" >> Doxyfile
+          echo "FULL_SIDEBAR           = NO" >> Doxyfile
+          echo "HTML_EXTRA_STYLESHEET  = doxygen-awesome.css doxygen-awesome-sidebar-only.css" >> Doxyfile
+          rm -rf doxygen-awesome-css.tar.gz doxygen-awesome-css/
+          
+      - name: Set Doxygen project version
+        run: |
+          if [ "${{ env.IS_TAG }}" = "true" ]; then
+            echo PROJECT_NUMBER = ${NEWEST_TAG} >> Doxyfile
+          else
+            latest_tag=$(curl -s https://api.github.com/repos/${{ env.REPO }}/releases/latest | jq -r '.tag_name')
+            echo PROJECT_NUMBER = ${latest_tag} >> Doxyfile
+          fi
+
+      - name: Generate Doxygen Documentation
+        uses: mattnotmitt/doxygen-action@edge
+        with:
+          additional-packages: openjdk21 python3 plantuml
+          # enable-latex: true
+          addidtional_paths: plantuml.jar 
+
+      - name: Deploy HTML Documentation
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ${{env.HTML_DIR}}
+
+      - name: Compile Polish PDF
+        if: env.IS_TAG == 'true'
+        uses: xu-cheng/latex-action@3.2.0
+        with:
+          extra_system_packages: "inkscape"
+          latexmk_shell_escape: true
+          working_directory: ${{env.LATEX_DIR}}
+          root_file: refman.tex
+      
+      - name: Copy Polish PDF
+        # if: env.IS_TAG == 'true'
+        run: cp ${{env.LATEX_DIR}}refman.pdf ./pl-${{ env.FILE_NAME }}.pdf
+
+      - name: Change Doxyfile language to English
+        if: env.IS_TAG == 'true'
+        run: sed -i 's/OUTPUT_LANGUAGE        = Polish/OUTPUT_LANGUAGE        = English/' Doxyfile
+
+      - name: Generate English Doxygen Documentation
+        if: env.IS_TAG == 'true'
+        uses: mattnotmitt/doxygen-action@edge
+        with:
+          additional-packages: openjdk21 python3 plantuml
+          addidtional_paths: plantuml.jar
+
+      - name: Compile English PDF
+        if: env.IS_TAG == 'true'
+        uses: xu-cheng/latex-action@3.2.0
+        with:
+          extra_system_packages: "inkscape"
+          latexmk_shell_escape: true
+          working_directory: ${{env.LATEX_DIR}}
+          root_file: refman.tex
+
+      - name: Copy English PDF
+        if: env.IS_TAG == 'true'
+        run: cp ${{env.LATEX_DIR}}refman.pdf ./en-${{ env.FILE_NAME }}.pdf
+
+      - name: Release PDFs
+        if: env.IS_TAG == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: "pl-${{ env.FILE_NAME }}.pdf,en-${{ env.FILE_NAME }}.pdf"
+
+      - name: Send Discord Notification
+        if: env.IS_TAG == 'true'
+        run: |
+          curl -s -H "Content-Type: application/json" -d '{"content": "Stworzono dokumentację @everyone"}' ${{ secrets.DISCORD_WEBHOOK_URL }} &> /dev/null
